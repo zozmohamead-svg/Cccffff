@@ -1,0 +1,603 @@
+require("dotenv").config();
+
+const express = require("express");
+const session = require("express-session");
+const SQLiteStoreFactory = require("connect-sqlite3");
+const helmet = require("helmet");
+const rateLimit = require("express-rate-limit");
+const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
+const Database = require("better-sqlite3");
+
+const app = express();
+const PORT = Number(process.env.PORT || 3000);
+const isProduction = process.env.NODE_ENV === "production";
+
+const dataDir = path.join(__dirname, "data");
+fs.mkdirSync(dataDir, { recursive: true });
+
+const db = new Database(path.join(dataDir, "school.sqlite"));
+
+db.pragma("journal_mode = WAL");
+db.pragma("foreign_keys = ON");
+
+db.exec(`
+CREATE TABLE IF NOT EXISTS students (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    full_name TEXT NOT NULL,
+    class_name TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS admins (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS absences (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    student_id INTEGER NOT NULL,
+    absence_date TEXT NOT NULL,
+    note TEXT DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    FOREIGN KEY(student_id)
+    REFERENCES students(id)
+    ON DELETE CASCADE,
+
+    UNIQUE(student_id, absence_date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_absences_student_date
+ON absences(student_id, absence_date);
+`);
+
+function hashPassword(password) {
+    const salt = crypto.randomBytes(16);
+
+    const key = crypto.scryptSync(
+        password,
+        salt,
+        64,
+        {
+            N: 16384,
+            r: 8,
+            p: 1,
+            maxmem: 64 * 1024 * 1024
+        }
+    );
+
+    return `scrypt$16384$8$1$${salt.toString("base64url")}$${key.toString("base64url")}`;
+}
+
+function verifyPassword(password, stored) {
+    try {
+        const parts = stored.split("$");
+
+        if (parts.length !== 6) return false;
+
+        const salt = Buffer.from(parts[4], "base64url");
+        const expected = Buffer.from(parts[5], "base64url");
+
+        const actual = crypto.scryptSync(
+            password,
+            salt,
+            expected.length,
+            {
+                N: Number(parts[1]),
+                r: Number(parts[2]),
+                p: Number(parts[3]),
+                maxmem: 64 * 1024 * 1024
+            }
+        );
+
+        return crypto.timingSafeEqual(expected, actual);
+
+    } catch {
+        return false;
+    }
+}
+
+function currentMonth() {
+    const now = new Date();
+
+    const year = now.getFullYear();
+    const month = String(now.getMonth() + 1).padStart(2, "0");
+
+    return {
+        start: `${year}-${month}-01`,
+        end: new Date(year, now.getMonth() + 1, 1)
+            .toISOString()
+            .slice(0, 10),
+        name: `${year}-${month}`
+    };
+}
+
+function csrfToken(req) {
+    if (!req.session.csrf) {
+        req.session.csrf = crypto.randomBytes(32).toString("hex");
+    }
+
+    return req.session.csrf;
+}
+
+function checkCSRF(req, res, next) {
+    if (
+        !req.session.csrf ||
+        req.headers["x-csrf-token"] !== req.session.csrf
+    ) {
+        return res.status(403).json({
+            error: "الطلب غير صالح."
+        });
+    }
+
+    next();
+}
+
+function requireLogin(req, res, next) {
+    if (!req.session.user) {
+        return res.status(401).json({
+            error: "يجب تسجيل الدخول أولًا."
+        });
+    }
+
+    next();
+}
+
+function requireAdmin(req, res, next) {
+    if (
+        !req.session.user ||
+        req.session.user.role !== "admin"
+    ) {
+        return res.status(403).json({
+            error: "غير مسموح."
+        });
+    }
+
+    next();
+}
+
+app.disable("x-powered-by");
+
+app.use(helmet());
+
+app.use(express.json());
+
+app.use(express.urlencoded({
+    extended: false
+}));
+
+const SQLiteStore = SQLiteStoreFactory(session);
+
+app.use(
+    session({
+        store: new SQLiteStore({
+            db: "sessions.sqlite",
+            dir: dataDir,
+            table: "sessions"
+        }),
+
+        name: "school.sid",
+
+        secret:
+            process.env.SESSION_SECRET ||
+            "CHANGE_THIS_SECRET",
+
+        resave: false,
+
+        saveUninitialized: false,
+
+        cookie: {
+            httpOnly: true,
+            secure: isProduction,
+            sameSite: "strict",
+
+            maxAge:
+                1000 *
+                60 *
+                60 *
+                4
+        }
+    })
+);
+
+const loginLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: 10,
+
+    message: {
+        error:
+            "محاولات دخول كثيرة. حاول بعد قليل."
+    }
+});
+
+app.get("/api/csrf", (req, res) => {
+
+    res.json({
+        csrfToken: csrfToken(req)
+    });
+
+});
+
+app.post(
+    "/api/login",
+    loginLimiter,
+    checkCSRF,
+    async (req, res) => {
+
+        const username =
+            typeof req.body.username === "string"
+                ? req.body.username.trim()
+                : "";
+
+        const password =
+            typeof req.body.password === "string"
+                ? req.body.password
+                : "";
+
+        if (!username || !password) {
+
+            return res.status(401).json({
+                error:
+                    "اسم المستخدم أو كلمة المرور غير صحيحة."
+            });
+
+        }
+
+        const admin = db.prepare(`
+            SELECT *
+            FROM admins
+            WHERE username = ?
+        `).get(username);
+
+        if (
+            admin &&
+            verifyPassword(
+                password,
+                admin.password_hash
+            )
+        ) {
+
+            req.session.regenerate(err => {
+
+                if (err) {
+                    return res.status(500).json({
+                        error: "حدث خطأ."
+                    });
+                }
+
+                req.session.user = {
+                    id: admin.id,
+                    username: admin.username,
+                    role: "admin"
+                };
+
+                req.session.csrf =
+                    crypto.randomBytes(32).toString("hex");
+
+                res.json({
+                    ok: true,
+                    role: "admin",
+                    csrfToken: req.session.csrf
+                });
+
+            });
+
+            return;
+        }
+
+        const student = db.prepare(`
+            SELECT *
+            FROM students
+            WHERE username = ?
+        `).get(username);
+
+        if (
+            student &&
+            verifyPassword(
+                password,
+                student.password_hash
+            )
+        ) {
+
+            req.session.regenerate(err => {
+
+                if (err) {
+                    return res.status(500).json({
+                        error: "حدث خطأ."
+                    });
+                }
+
+                req.session.user = {
+                    id: student.id,
+                    username: student.username,
+                    role: "student"
+                };
+
+                req.session.csrf =
+                    crypto.randomBytes(32).toString("hex");
+
+                res.json({
+                    ok: true,
+                    role: "student",
+                    csrfToken: req.session.csrf
+                });
+
+            });
+
+            return;
+        }
+
+        return res.status(401).json({
+            error:
+                "اسم المستخدم أو كلمة المرور غير صحيحة."
+        });
+    }
+);
+
+app.get(
+    "/api/me",
+    requireLogin,
+    (req, res) => {
+
+        if (
+            req.session.user.role === "admin"
+        ) {
+
+            return res.json({
+                role: "admin"
+            });
+        }
+
+        const student = db.prepare(`
+            SELECT
+                id,
+                username,
+                full_name,
+                class_name
+            FROM students
+            WHERE id = ?
+        `).get(req.session.user.id);
+
+        if (!student) {
+            return res.status(401).json({
+                error: "الحساب غير موجود."
+            });
+        }
+
+        const month = currentMonth();
+
+        const result = db.prepare(`
+            SELECT COUNT(*) AS count
+            FROM absences
+            WHERE student_id = ?
+            AND absence_date >= ?
+            AND absence_date < ?
+        `).get(
+            student.id,
+            month.start,
+            month.end
+        );
+
+        res.json({
+            role: "student",
+
+            student: {
+                id: student.id,
+                username: student.username,
+                name: student.full_name,
+                class: student.class_name,
+                absenceCount: result.count,
+                month: month.name
+            }
+        });
+    }
+);
+
+app.get(
+    "/api/admin/students",
+    requireAdmin,
+    (req, res) => {
+
+        const month = currentMonth();
+
+        const students = db.prepare(`
+            SELECT
+                s.id,
+                s.username,
+                s.full_name,
+                s.class_name,
+
+                (
+                    SELECT COUNT(*)
+                    FROM absences a
+                    WHERE a.student_id = s.id
+                    AND a.absence_date >= ?
+                    AND a.absence_date < ?
+                ) AS absence_count
+
+            FROM students s
+
+            ORDER BY
+                s.class_name,
+                s.full_name
+        `).all(
+            month.start,
+            month.end
+        );
+
+        res.json({
+            students
+        });
+    }
+);
+
+app.post(
+    "/api/admin/students",
+    requireAdmin,
+    checkCSRF,
+    async (req, res) => {
+
+        const {
+            username,
+            password,
+            full_name,
+            class_name
+        } = req.body;
+
+        if (
+            !username ||
+            !password ||
+            !full_name ||
+            !class_name
+        ) {
+            return res.status(400).json({
+                error:
+                    "كل بيانات الطالب مطلوبة."
+            });
+        }
+
+        const hash =
+            hashPassword(password);
+
+        try {
+
+            const result = db.prepare(`
+                INSERT INTO students
+                (
+                    username,
+                    password_hash,
+                    full_name,
+                    class_name
+                )
+                VALUES (?, ?, ?, ?)
+            `).run(
+                username.trim(),
+                hash,
+                full_name.trim(),
+                class_name.trim()
+            );
+
+            res.json({
+                ok: true,
+                id: result.lastInsertRowid
+            });
+
+        } catch {
+
+            res.status(409).json({
+                error:
+                    "اسم المستخدم مستخدم بالفعل."
+            });
+        }
+    }
+);
+
+app.post(
+    "/api/admin/students/:id/absences",
+    requireAdmin,
+    checkCSRF,
+    (req, res) => {
+
+        const studentId =
+            Number(req.params.id);
+
+        const {
+            absence_date,
+            note = ""
+        } = req.body;
+
+        if (
+            !studentId ||
+            !absence_date
+        ) {
+            return res.status(400).json({
+                error:
+                    "أدخل تاريخ الغياب."
+            });
+        }
+
+        try {
+
+            db.prepare(`
+                INSERT INTO absences
+                (
+                    student_id,
+                    absence_date,
+                    note
+                )
+                VALUES (?, ?, ?)
+            `).run(
+                studentId,
+                absence_date,
+                note
+            );
+
+            res.json({
+                ok: true
+            });
+
+        } catch {
+
+            res.status(409).json({
+                error:
+                    "تم تسجيل هذا اليوم بالفعل."
+            });
+        }
+    }
+);
+
+app.delete(
+    "/api/admin/absences/:id",
+    requireAdmin,
+    checkCSRF,
+    (req, res) => {
+
+        db.prepare(`
+            DELETE FROM absences
+            WHERE id = ?
+        `).run(
+            Number(req.params.id)
+        );
+
+        res.json({
+            ok: true
+        });
+    }
+);
+
+app.post(
+    "/api/logout",
+    checkCSRF,
+    (req, res) => {
+
+        req.session.destroy(() => {
+
+            res.clearCookie("school.sid");
+
+            res.json({
+                ok: true
+            });
+
+        });
+    }
+);
+
+app.use(
+    express.static(
+        path.join(__dirname, "public")
+    )
+);
+
+app.listen(
+    PORT,
+    () => {
+        console.log(
+            `الموقع يعمل على http://localhost:${PORT}`
+        );
+    }
+);
